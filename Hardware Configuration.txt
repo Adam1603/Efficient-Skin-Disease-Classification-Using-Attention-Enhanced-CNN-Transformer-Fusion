@@ -1,0 +1,7 @@
+GPU: Google Colab utilizing T4 GPUs
+
+RAM: 12 GB (Colab environment)
+
+OS: Ubuntu (Colab runtime)
+
+No multi-GPU or distributed training was used.

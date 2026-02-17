@@ -1,0 +1,11 @@
+import tensorflow as tf
+import numpy as np
+import random
+import os
+
+SEED = 42
+tf.random.set_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+os.environ['PYTHONHASHSEED'] = str(SEED)
+Dataset split ratio: 70:30

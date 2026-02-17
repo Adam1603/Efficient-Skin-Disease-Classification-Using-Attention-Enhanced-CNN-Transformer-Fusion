@@ -1,0 +1,13 @@
+| Parameter       | Value                     |
+| --------------- | ------------------------- |
+| Learning Rate   | 0.001                     |
+| Optimizer       | Adam                      |
+| Weight Decay    | 1e-6                      |
+| Momentum        | 0.9                       |
+| Batch Size      | 32                        |
+| Epochs (Single) | 40                        |
+| Epochs (Fusion) | 60                        |
+| Loss Function   | Cross-Entropy Loss and 
+		Weighted Cross-Entropy Loss|
+| Activation      | ReLU                      |
+| Dropout         | 0.5                       |
