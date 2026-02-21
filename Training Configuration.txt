@@ -6,6 +6,7 @@
 | Batch Size      | 32                                           |
 | Epochs (Single) | 40                                           |
 | Epochs (Fusion) | 60                                           |
-| Loss Function   | CrossEntropyLoss / Weighted CrossEntropyLoss |
+| Loss Function   | Weighted CrossEntropyLoss |
 | Activation      | ReLU                                         |
 | Dropout         | 0.5                                          |
+
