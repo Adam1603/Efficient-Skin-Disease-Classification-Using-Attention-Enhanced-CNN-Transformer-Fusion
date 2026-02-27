@@ -4,9 +4,9 @@
 | Optimizer       | Adam (β₁=0.9, β₂=0.999)                      |
 | Weight Decay    | 1e-6                                         |
 | Batch Size      | 32                                           |
-| Epochs (Single) | 40                                           |
-| Epochs (Fusion) | 60                                           |
+| Epochs          | 100                                           |
 | Loss Function   | Weighted CrossEntropyLoss |
 | Activation      | ReLU                                         |
 | Dropout         | 0.5                                          |
+
 
