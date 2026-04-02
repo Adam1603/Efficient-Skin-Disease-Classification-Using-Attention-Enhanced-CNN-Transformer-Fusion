@@ -1,0 +1,486 @@
+We have included end-to-end training scripts with:
+o	Model architecture definitions
+o	Hyperparameter settings (learning rate, batch size, optimizer, epochs, etc.)
+o	Training procedures for both individual models and the fusion framework
+o	Random seed initialization to ensure reproducibility
+
+# CBAM: Channel + Spatial Attention
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(in_planes, max(in_planes // reduction, 8), kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(max(in_planes // reduction, 8), in_planes, kernel_size=1, bias=True)
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.mlp(self.avg_pool(x))
+        max_out = self.mlp(self.max_pool(x))
+        return self.sigmoid(avg_out + max_out) * x
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        padding = (kernel_size - 1) // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        return self.sigmoid(self.conv(torch.cat([avg_out, max_out], dim=1))) * x
+
+class CBAM(nn.Module):
+    def __init__(self, channels, reduction=16, spatial_kernel=7):
+        super().__init__()
+        self.ca = ChannelAttention(channels, reduction=reduction)
+        self.sa = SpatialAttention(kernel_size=spatial_kernel)
+
+    def forward(self, x):
+        return self.sa(self.ca(x))
+
+
+# Patch embedding from CNN feature map + Transformer + MLP head
+class PatchEmbeddingFromFeatureMap(nn.Module):
+    def __init__(self, in_channels, embed_dim, spatial_size=(7, 7), use_cls_token=True):
+        super().__init__()
+        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=1)
+        self.use_cls_token = use_cls_token
+        self.embed_dim = embed_dim
+        self.spatial_size = spatial_size
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim)) if use_cls_token else None
+        num_patches = spatial_size[0] * spatial_size[1]
+        nb_tokens = num_patches + (1 if use_cls_token else 0)
+        self.pos_embed = nn.Parameter(torch.randn(1, nb_tokens, embed_dim))
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x = self.proj(x)
+        x = x.flatten(2).transpose(1, 2)
+        if self.use_cls_token:
+            x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
+        return x + self.pos_embed
+
+class HybridResNetTransformer(nn.Module):
+    """ResNet backbone → optional CBAM → Patch embedding → optional Transformer → optional fusion refinement → MLP head.
+
+    Manuscript ablations (see ABLATION_REGISTRY):
+    - use_cbam: CNN + Transformer *with* vs *without* channel/spatial attention (CBAM).
+    - use_transformer: if False, GlobalAvgPool on CNN features + linear head (CNN path only, still uses ResNet trunk).
+    - use_fusion_refinement: extra MLP on the token representation before the classifier head.
+    """
+    def __init__(self, num_classes=NUM_CLASSES, resnet_pretrained=True, embed_dim=256, transformer_depth=4,
+                 transformer_heads=8, transformer_mlp_dim=1024, transformer_dropout=0.5, head_dropout=0.5,
+                 use_cls_token=True, freeze_backbone=False, use_cbam=True, use_transformer=True,
+                 use_fusion_refinement=False):
+        super().__init__()
+        self.use_cls_token = use_cls_token
+        self.use_cbam = use_cbam
+        self.use_transformer = use_transformer
+        self.use_fusion_refinement = use_fusion_refinement
+        try:
+            resnet = (models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1 if resnet_pretrained else None) if USE_RESNET50 else models.resnet101(weights=models.ResNet101_Weights.IMAGENET1K_V1 if resnet_pretrained else None))
+        except AttributeError:
+            resnet = (models.resnet50(pretrained=resnet_pretrained) if USE_RESNET50 else models.resnet101(pretrained=resnet_pretrained))
+        self.backbone = nn.Sequential(
+            resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
+            resnet.layer1, resnet.layer2, resnet.layer3, resnet.layer4
+        )
+        backbone_out_channels = 2048
+        if freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+        self.cbam = CBAM(backbone_out_channels) if use_cbam else nn.Identity()
+        if use_transformer:
+            self.patch_embed = PatchEmbeddingFromFeatureMap(
+                in_channels=backbone_out_channels, embed_dim=embed_dim,
+                spatial_size=(7, 7), use_cls_token=use_cls_token
+            )
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=embed_dim, nhead=transformer_heads, dim_feedforward=transformer_mlp_dim,
+                dropout=transformer_dropout, activation='relu', batch_first=True
+            )
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=transformer_depth)
+            dim_head_in = embed_dim
+        else:
+            self.patch_embed = None
+            self.transformer = None
+            self.cnn_pool = nn.AdaptiveAvgPool2d(1)
+            dim_head_in = backbone_out_channels
+        self.fusion_refine = nn.Sequential(
+            nn.Linear(dim_head_in, dim_head_in),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=head_dropout),
+        ) if use_fusion_refinement else nn.Identity()
+        self.mlp_head = nn.Sequential(
+            nn.Linear(dim_head_in, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(head_dropout),
+            nn.Linear(512, num_classes)
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        feat = self.backbone(x)
+        feat = self.cbam(feat)
+        if not self.use_transformer:
+            xvec = torch.flatten(self.cnn_pool(feat), 1)
+            xvec = self.fusion_refine(xvec)
+            return self.mlp_head(xvec)
+        tokens = self.patch_embed(feat)
+        tokens = self.transformer(tokens)
+        cls_rep = tokens[:, 0] if self.use_cls_token else tokens.mean(dim=1)
+        cls_rep = self.fusion_refine(cls_rep)
+        return self.mlp_head(cls_rep)
+
+class EfficientNetClassifier(nn.Module):
+    """EfficientNet-B1: often 85-90%% on HAM10000."""
+    def __init__(self, num_classes=NUM_CLASSES, dropout=0.25):
+        super().__init__()
+        try:
+            self.backbone = models.efficientnet_b1(weights=models.EfficientNet_B1_Weights.IMAGENET1K_V1)
+        except AttributeError:
+            self.backbone = models.efficientnet_b1(pretrained=True)
+        in_features = self.backbone.classifier[1].in_features
+        self.backbone.classifier = nn.Sequential(nn.Dropout(p=dropout), nn.Linear(in_features, num_classes))
+
+    def forward(self, x):
+        return self.backbone(x)
+
+
+class ResNet50Classifier(nn.Module):
+   
+    def __init__(self, num_classes=NUM_CLASSES, dropout=0.3):
+        super().__init__()
+        try:
+            resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+        except AttributeError:
+            resnet = models.resnet50(pretrained=True)
+        in_features = resnet.fc.in_features
+        resnet.fc = nn.Sequential(nn.Dropout(p=dropout), nn.Linear(in_features, num_classes))
+        self.backbone = resnet
+
+    def forward(self, x):
+        return self.backbone(x)
+
+# ABLATION_REGISTRY: names -> constructor kwargs for HybridResNetTransformer (and special cases)
+ABLATION_REGISTRY = {
+    'baseline_cnn': {'kind': 'resnet50'},
+    'cnn_backbone_gap_only': {'kind': 'hybrid', 'use_cbam': False, 'use_transformer': False, 'use_fusion_refinement': False},
+    'cnn_cbam_gap_only': {'kind': 'hybrid', 'use_cbam': True, 'use_transformer': False, 'use_fusion_refinement': False},
+    'transformer_only': {'kind': 'transformer_only'},
+    'cnn_transformer_no_attention': {'kind': 'hybrid', 'use_cbam': False, 'use_transformer': True, 'use_fusion_refinement': False},
+    'cnn_transformer_with_attention': {'kind': 'hybrid', 'use_cbam': True, 'use_transformer': True, 'use_fusion_refinement': False},
+    'proposed_with_fusion_refine': {'kind': 'hybrid', 'use_cbam': True, 'use_transformer': True, 'use_fusion_refinement': True},
+    'proposed_no_fusion_refine': {'kind': 'hybrid', 'use_cbam': True, 'use_transformer': True, 'use_fusion_refinement': False},
+}
+
+class TransformerOnlySkin(nn.Module):
+    """Manuscript baseline: Transformer-only — patch embedding from RGB, Transformer encoder, CLS classify (no ResNet)."""
+    def __init__(self, num_classes=NUM_CLASSES, embed_dim=256, depth=4, heads=8, mlp_dim=1024, dropout=0.35,
+                 patch_size=16, img_size=224):
+        super().__init__()
+        self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
+        nb = H * W + 1
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.randn(1, nb, embed_dim) * 0.02)
+        enc = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=heads, dim_feedforward=mlp_dim,
+            dropout=dropout, activation='relu', batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc, num_layers=depth)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes)
+
+    def forward(self, x):
+        B = x.size(0)
+        x = self.patch_embed(x)
+        x = x.flatten(2).transpose(1, 2)
+        cls = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls, x], dim=1) + self.pos_embed
+        x = self.encoder(x)
+        x = self.norm(x[:, 0])
+        return self.head(x)
+
+
+def build_ablation_model(name, dropout=None):
+    """Build model for manuscript ablation `name` (see ABLATION_REGISTRY)."""
+    d = dropout if dropout is not None else DROPOUT
+    cfg = ABLATION_REGISTRY.get(name)
+    if cfg is None:
+        raise ValueError('Unknown ablation %r. Choose one of: %s' % (name, list(ABLATION_REGISTRY.keys())))
+    kind = cfg['kind']
+    if kind == 'resnet50':
+        return ResNet50Classifier(num_classes=NUM_CLASSES, dropout=d)
+    if kind == 'transformer_only':
+        return TransformerOnlySkin(num_classes=NUM_CLASSES, dropout=d, mlp_dim=1024, depth=4, heads=8, patch_size=16, img_size=IMG_SIZE)
+    if kind == 'hybrid':
+        kw = {k: v for k, v in cfg.items() if k != 'kind'}
+        return HybridResNetTransformer(
+            num_classes=NUM_CLASSES, resnet_pretrained=True, embed_dim=256, transformer_depth=4,
+            transformer_heads=8, transformer_mlp_dim=1024, transformer_dropout=d, head_dropout=d,
+            use_cls_token=True, **kw,
+        )
+    raise ValueError(kind)
+
+
+MEL_IDX = CLASS_NAMES.index('mel')  # melanoma — report recall (sensitivity) explicitly
+
+def mcnemar_test(y_true, pred_a, pred_b):
+    """McNemar on paired predictions (same test images). pred_a = model A, pred_b = model B."""
+    y_true = np.asarray(y_true).ravel()
+    pred_a = np.asarray(pred_a).ravel()
+    pred_b = np.asarray(pred_b).ravel()
+    # Discordant counts: A correct & B wrong vs A wrong & B correct
+    n_aw_bx = int(np.sum((pred_a == y_true) & (pred_b != y_true)))
+    n_ax_bw = int(np.sum((pred_a != y_true) & (pred_b == y_true)))
+    nn = n_aw_bx + n_ax_bw
+    stat = (abs(n_aw_bx - n_ax_bw) - 1) ** 2 / (nn + 1e-12) if nn > 0 else 0.0
+    p_chi = float(1 - scipy_stats.chi2.cdf(stat, df=1)) if nn > 0 else 1.0
+    p_binom = float(np.nan)
+    try:
+        p_binom = scipy_stats.binomtest(min(n_aw_bx, n_ax_bw), nn, 0.5, alternative='two-sided').pvalue
+    except Exception:
+        try:
+            p_binom = float(scipy_stats.binom.sf(min(n_aw_bx, n_ax_bw) - 1, nn, 0.5) * 2)
+            if p_binom > 1.0:
+                p_binom = 1.0
+        except Exception:
+            pass
+    return {
+        'n_only_A_correct': n_aw_bx, 'n_only_B_correct': n_ax_bw,
+        'chi2_stat': float(stat), 'p_chi2': p_chi, 'p_exact_two_sided': p_binom,
+    }
+
+
+def detailed_classification_metrics(y_true, y_pred, class_names=None):
+    """Per-class + macro/weighted P/R/F1, accuracy, kappa; melanoma sensitivity highlighted."""
+    names = class_names or CLASS_NAMES
+    prec_pc, rec_pc, f1_pc, sup = precision_recall_fscore_support(
+        y_true, y_pred, labels=list(range(len(names))), zero_division=0)
+    prec_m, rec_m, f1_m, _ = precision_recall_fscore_support(
+        y_true, y_pred, average='macro', zero_division=0)
+    prec_w, rec_w, f1_w, _ = precision_recall_fscore_support(
+        y_true, y_pred, average='weighted', zero_division=0)
+    acc = float((np.asarray(y_true) == np.asarray(y_pred)).mean())
+    kap = float(cohen_kappa_score(y_true, y_pred))
+    out = {
+        'accuracy': acc, 'cohen_kappa': kap,
+        'macro_precision': prec_m, 'macro_recall': rec_m, 'macro_f1': f1_m,
+        'weighted_precision': prec_w, 'weighted_recall': rec_w, 'weighted_f1': f1_w,
+        'per_class': {names[i]: {'precision': float(prec_pc[i]), 'recall': float(rec_pc[i]),
+                      'f1': float(f1_pc[i]), 'support': int(sup[i])} for i in range(len(names))},
+        'melanoma_sensitivity_recall': float(rec_pc[MEL_IDX]),
+    }
+    return out
+
+
+def print_metrics_manuscript(m, title='Evaluation metrics'):
+    print('=' * 70)
+    print(title)
+    print('=' * 70)
+    print('Accuracy: %.4f | Cohen kappa: %.4f' % (m['accuracy'], m['cohen_kappa']))
+    print('Macro    — P: %.4f R: %.4f F1: %.4f' % (m['macro_precision'], m['macro_recall'], m['macro_f1']))
+    print('Weighted — P: %.4f R: %.4f F1: %.4f' % (m['weighted_precision'], m['weighted_recall'], m['weighted_f1']))
+    print('*** Melanoma (mel) sensitivity (recall): %.4f ***' % m['melanoma_sensitivity_recall'])
+    print('--- Per-class ---')
+    for c, v in m['per_class'].items():
+        print('  %s: P=%.4f R=%.4f F1=%.4f (n=%d)' % (c, v['precision'], v['recall'], v['f1'], v['support']))
+
+print('Ablation builders and metric helpers loaded (build_ablation_model, mcnemar_test, detailed_classification_metrics).')
+
+
+
+# Device — must show cuda for B200 GPU; if cpu, reinstall PyTorch with CUDA
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+    print('Device: CUDA —', torch.cuda.get_device_name(0), '(training will be fast)')
+else:
+    print('Device: CPU — SLOW! Install: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121')
+
+# Class weights: Effective Number of Samples (best for imbalanced) — weight = (1-beta)/(1-beta^n)
+if train_loader is not None:
+    all_labels = []
+    for _, labels in train_loader:
+        all_labels.extend(labels.tolist())
+    _, counts = np.unique(all_labels, return_counts=True)
+    beta = 0.9999   # Effective Number; smaller beta = stronger reweighting
+    effective_num = 1.0 - np.power(beta, counts.astype(float))
+    class_weights = (1.0 - beta) / (effective_num + 1e-8)
+    class_weights = torch.tensor(class_weights, dtype=torch.float32)
+    class_weights = class_weights / class_weights.sum() * NUM_CLASSES
+    class_weights = class_weights.to(device)
+else:
+    class_weights = torch.ones(NUM_CLASSES).to(device)
+
+# Focal Loss for imbalanced classes (helps focus on hard examples)
+class FocalLoss(nn.Module):
+    def __init__(self, weight=None, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.weight = weight
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        ce = F.cross_entropy(logits, targets, weight=self.weight, reduction='none')
+        pt = torch.exp(-ce)
+        focal = ((1 - pt) ** self.gamma) * ce
+        return focal.mean() if self.reduction == 'mean' else focal.sum()
+
+if USE_FOCAL_LOSS:
+    criterion = FocalLoss(weight=class_weights, gamma=FOCAL_GAMMA)
+else:
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=LABEL_SMOOTHING)
+# Model: ResNet50 (98%%), ResNet18, ResNet34, EfficientNet, or Hybrid ResNet+Transformer
+if USE_RESNET50_ACCURACY:
+    model = ResNet50Classifier(num_classes=NUM_CLASSES, dropout=DROPOUT).to(device)
+elif USE_RESNET18_FAST:
+    model = ResNet18Classifier(num_classes=NUM_CLASSES, dropout=DROPOUT).to(device)
+elif USE_RESNET34_FAST:
+    model = ResNet34Classifier(num_classes=NUM_CLASSES, dropout=DROPOUT).to(device)
+elif USE_EFFICIENTNET:
+    model = EfficientNetClassifier(num_classes=NUM_CLASSES, dropout=DROPOUT).to(device)
+else:
+    try:
+        model = HybridResNetTransformer(
+            num_classes=NUM_CLASSES, resnet_pretrained=True, embed_dim=256, transformer_depth=4,
+            transformer_heads=8, transformer_mlp_dim=1024, transformer_dropout=DROPOUT, head_dropout=DROPOUT,
+            use_cls_token=True,
+        ).to(device)
+    except TypeError:
+        model = HybridResNetTransformer(
+            num_classes=NUM_CLASSES, resnet_pretrained=True, embed_dim=256, transformer_depth=4,
+            transformer_heads=8, transformer_mlp_dim=1024, transformer_dropout=DROPOUT, head_dropout=DROPOUT,
+        ).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, betas=(0.9, 0.999), weight_decay=WEIGHT_DECAY)
+if (USE_RESNET50_ACCURACY or USE_RESNET18_FAST or USE_RESNET34_FAST or USE_EFFICIENTNET) and train_loader is not None:
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=LEARNING_RATE, epochs=EPOCHS_SINGLE, steps_per_epoch=len(train_loader), pct_start=0.1)
+else:
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=LR_PATIENCE, verbose=True)
+print('Model parameters:', sum(p.numel() for p in model.parameters()))
+
+
+
+# Training loop — with early stopping, LR scheduler, best model checkpoint, AMP
+if train_loader is None or val_loader is None:
+    print('No train/val loader. Run data cells first.')
+else:
+    use_amp = USE_AMP and torch.cuda.is_available()
+    if use_amp:
+        print('Using AMP (mixed precision) for faster training')
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
+    n_epochs = EPOCHS_SINGLE
+    best_val_acc = 0.0
+    best_model_state = None
+    patience_counter = 0
+    WARMUP_EPOCHS = 5
+    for epoch in range(n_epochs):
+        # LR warmup (skip for OneCycleLR which has built-in warmup)
+        if not (USE_RESNET50_ACCURACY or USE_RESNET18_FAST or USE_RESNET34_FAST or USE_EFFICIENTNET) and epoch < WARMUP_EPOCHS:
+            for pg in optimizer.param_groups:
+                pg['lr'] = LEARNING_RATE * (epoch + 1) / WARMUP_EPOCHS
+        model.train()
+        running_loss, correct, total = 0.0, 0, 0
+        optimizer.zero_grad()
+        for i, (imgs, labels) in enumerate(train_loader):
+            imgs, labels = imgs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+            # Mixup for regularization
+            do_mixup = MIXUP_ALPHA > 0
+            if do_mixup and imgs.size(0) > 1:
+                lam = np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA)
+                idx = torch.randperm(imgs.size(0), device=imgs.device)
+                imgs = lam * imgs + (1 - lam) * imgs[idx]
+                labels_b = labels[idx]
+            if use_amp:
+                with torch.cuda.amp.autocast():
+                    logits = model(imgs)
+                    if do_mixup and imgs.size(0) > 1:
+                        loss = (lam * criterion(logits, labels) + (1 - lam) * criterion(logits, labels_b)) / ACCUM_STEPS
+                    else:
+                        loss = criterion(logits, labels) / ACCUM_STEPS
+                scaler.scale(loss).backward()
+            else:
+                logits = model(imgs)
+                if do_mixup and imgs.size(0) > 1:
+                    loss = (lam * criterion(logits, labels) + (1 - lam) * criterion(logits, labels_b)) / ACCUM_STEPS
+                else:
+                    loss = criterion(logits, labels) / ACCUM_STEPS
+                loss.backward()
+            running_loss += loss.item() * ACCUM_STEPS
+            _, pred = logits.max(1)
+            total += labels.size(0)
+            correct += (pred == labels).sum().item()
+            if (i + 1) % ACCUM_STEPS == 0 or (i + 1) == len(train_loader):
+                if use_amp:
+                    scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                if use_amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                if USE_RESNET50_ACCURACY or USE_RESNET18_FAST or USE_RESNET34_FAST or USE_EFFICIENTNET:
+                    scheduler.step()
+                optimizer.zero_grad()
+        train_loss = running_loss / len(train_loader)
+        train_acc = 100.0 * correct / total
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        # Validate every VAL_EVERY_N epochs (faster)
+        if (epoch + 1) % VAL_EVERY_N == 0 or epoch == 0:
+            model.eval()
+            val_loss, correct_v, total_v = 0.0, 0, 0
+            with torch.no_grad():
+                for imgs, labels in val_loader:
+                    imgs, labels = imgs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+                    logits = model(imgs)
+                    val_loss += criterion(logits, labels).item()
+                    _, pred = logits.max(1)
+                    total_v += labels.size(0)
+                    correct_v += (pred == labels).sum().item()
+            val_loss /= len(val_loader)
+            val_acc = 100.0 * correct_v / total_v if total_v else 0.0
+        else:
+            val_acc = history['val_acc'][-1] if history['val_acc'] else 0.0
+            val_loss = history['val_loss'][-1] if history['val_loss'] else 0.0
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        did_validate = (epoch + 1) % VAL_EVERY_N == 0 or epoch == 0
+        if epoch >= WARMUP_EPOCHS and not (USE_RESNET50_ACCURACY or USE_RESNET18_FAST or USE_RESNET34_FAST or USE_EFFICIENTNET):
+            scheduler.step(val_acc)
+        if did_validate and val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        elif did_validate:
+            patience_counter += 1
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print('Epoch %d/%d — train loss: %.4f acc: %.2f%% | val loss: %.4f acc: %.2f%% (best: %.2f%%)' % (
+                epoch + 1, n_epochs, train_loss, train_acc, val_loss, val_acc, best_val_acc))
+        if patience_counter >= PATIENCE:
+            print('Early stopping at epoch %d (no improvement for %d epochs)' % (epoch + 1, PATIENCE))
+            break
+    if best_model_state is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_model_state.items()})
+        print('Loaded best model (val_acc=%.2f%%)' % best_val_acc)
+    print('Training completed.')
+
+
+
