@@ -1,0 +1,224 @@
+We have added detailed preprocessing scripts, including image resizing, normalization, augmentation techniques (e.g., flipping, cropping, zooming), and 
+dataset splitting procedures. These scripts ensure that the data preparation process can be fully replicated.
+
+# Config — optimized 
+LEARNING_RATE = 0.0005
+WEIGHT_DECAY = 1e-5
+BATCH_SIZE = 32
+ACCUM_STEPS = 1
+EPOCHS_SINGLE = 80
+EPOCHS_FUSION = 80
+USE_AMP = True
+USE_EFFICIENTNET = False
+USE_RESNET34_FAST = False
+USE_RESNET18_FAST = False
+USE_RESNET50_ACCURACY = True   # ResNet50 for 98%%
+USE_RESNET50 = False
+DROPOUT = 0.3
+MIXUP_ALPHA = 0.2
+VAL_EVERY_N = 2
+IMG_SIZE = 224
+RANDOM_SEED = 42
+TRAIN_RATIO = 0.7
+VAL_RATIO = 0.15
+PATIENCE = 12
+LR_PATIENCE = 8
+LABEL_SMOOTHING = 0.05
+USE_FOCAL_LOSS = False   # Focal loss caused collapse; CrossEntropy + label_smoothing is more stable
+FOCAL_GAMMA = 2.0
+
+# HAM10000: 7 classes (dx in metadata)
+CLASS_NAMES = ['akiec', 'bcc', 'bkl', 'df', 'mel', 'nv', 'vasc']
+NUM_CLASSES = len(CLASS_NAMES)
+CLASS_TO_IDX = {c: i for i, c in enumerate(CLASS_NAMES)}
+
+# Transforms: ImageNet normalization (best for pretrained CNNs)
+try:
+    interp = transforms.InterpolationMode.BICUBIC
+except AttributeError:
+    interp = 3  # BICUBIC fallback for older torchvision
+train_transform = transforms.Compose([
+    transforms.RandomRotation(15),
+    transforms.Resize(256, interpolation=interp),
+    transforms.RandomResizedCrop(IMG_SIZE),
+    transforms.RandomHorizontalFlip(),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+test_transform = transforms.Compose([
+    transforms.Resize(256, interpolation=interp),
+    transforms.CenterCrop(IMG_SIZE),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+print('Config: LR=%.4f, ResNet50=%s, img=%d, batch=%d, epochs=%d (98%% target)' % (
+    LEARNING_RATE, USE_RESNET50_ACCURACY, IMG_SIZE, BATCH_SIZE, EPOCHS_SINGLE))
+
+
+
+# Load DATASET
+NOTEBOOK_DIR = Path(os.getcwd())
+DATA_ROOT = NOTEBOOK_DIR / 'skin_disease/'
+# Override: DATA_ROOT = Path('/your/path/to/HAM1000')
+METADATA_CSV = DATA_ROOT / 'HAM10000_metadata.csv'
+IMG_DIRS = [DATA_ROOT / 'HAM10000_images_part_1', DATA_ROOT / 'HAM10000_images_part_2']
+
+def find_image_path(img_id, search_dirs):
+    """Search for image_id in part_1 and part_2 folders."""
+    for ext in ['.jpg', '.png', '.jpeg']:
+        for d in search_dirs:
+            if d.exists():
+                p = d / (img_id + ext)
+                if p.exists():
+                    return p
+    for d in search_dirs:
+        if d.exists():
+            for f in d.glob(img_id + '*'):
+                if f.suffix.lower() in ['.jpg', '.jpeg', '.png']:
+                    return f
+    return None
+
+def load_ham10000_metadata(csv_path, img_dirs):
+    df = pd.read_csv(csv_path)
+    if 'dx' not in df.columns:
+        raise ValueError('Metadata must have "dx" column. Columns: %s' % list(df.columns))
+    rows = []
+    for _, r in df.iterrows():
+        img_id = r.get('image_id', str(r.get('lesion_id', '')))
+        p = find_image_path(img_id, img_dirs)
+        if p is None:
+            continue
+        dx = r['dx'].strip().lower()
+        if dx not in CLASS_TO_IDX:
+            continue
+        rows.append({'image_path': str(p), 'label': CLASS_TO_IDX[dx], 'dx': dx})
+    return pd.DataFrame(rows)
+
+if METADATA_CSV.exists():
+    meta = load_ham10000_metadata(METADATA_CSV, IMG_DIRS)
+    if len(meta) == 0:
+        df = pd.read_csv(METADATA_CSV)
+        meta = []
+        for _, r in df.iterrows():
+            img_id = r.get('image_id', str(r.get('lesion_id', '')))
+            for d in IMG_DIRS:
+                if not Path(d).exists():
+                    continue
+                for p in Path(d).rglob(img_id + '*'):
+                    if p.suffix.lower() in ['.jpg', '.jpeg', '.png']:
+                        dx = r.get('dx', 'nv').strip().lower()
+                        if dx in CLASS_TO_IDX:
+                            meta.append({'image_path': str(p), 'label': CLASS_TO_IDX[dx], 'dx': dx})
+                        break
+                else:
+                    continue
+                break
+        meta = pd.DataFrame(meta)
+    print('Loaded %d samples from HAM10000' % len(meta))
+    print(meta['dx'].value_counts())
+else:
+    meta = None
+    print('HAM10000 not found. Expected: HAM1000/HAM10000_metadata.csv, HAM1000/HAM10000_images_part_1/*.jpg, HAM1000/HAM10000_images_part_2/*.jpg')
+
+
+
+# Dataset class and 70:30 train/test split
+class HAM10000Dataset(Dataset):
+    def __init__(self, dataframe, transform=None):
+        self.data = dataframe.reset_index(drop=True)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+        img = Image.open(row['image_path']).convert('RGB')
+        label = row['label']
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+if meta is not None and len(meta) > 0:
+    train_df, test_df = train_test_split(meta, test_size=1 - TRAIN_RATIO, stratify=meta['label'], random_state=RANDOM_SEED)
+    train_df, val_df = train_test_split(train_df, test_size=VAL_RATIO, stratify=train_df['label'], random_state=RANDOM_SEED)
+    # Oversampling: FULL balance (each class = max_count) for better accuracy on minorities
+    USE_OVERSAMPLING = True
+    if USE_OVERSAMPLING:
+        counts = train_df['label'].value_counts()
+        target = int(counts.max())   # Full balance: every class has same count as majority
+        train_dfs = []
+        for lbl in range(NUM_CLASSES):
+            sub = train_df[train_df['label'] == lbl]
+            n = len(sub)
+            if n < target:
+                extra = sub.sample(n=target - n, replace=True, random_state=RANDOM_SEED)
+                sub = pd.concat([sub, extra], ignore_index=True)
+            train_dfs.append(sub)
+        train_df = pd.concat(train_dfs, ignore_index=True).sample(frac=1, random_state=RANDOM_SEED).reset_index(drop=True)
+        print('Oversampled train: %d samples (full balance, %d per class)' % (len(train_df), target))
+    train_ds = HAM10000Dataset(train_df, transform=train_transform)
+    val_ds = HAM10000Dataset(val_df, transform=test_transform)
+    test_ds = HAM10000Dataset(test_df, transform=test_transform)
+    # For 5-crop TTA: resize only (no crop); use 128 when IMG_SIZE=96
+    tta_sz = 256 if IMG_SIZE >= 224 else 160
+    test_transform_256 = transforms.Compose([transforms.Resize(tta_sz, interpolation=interp), transforms.ToTensor(), transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+    test_ds_256 = HAM10000Dataset(test_df, transform=test_transform_256)
+    use_gpu = torch.cuda.is_available()
+    num_workers = 0   # 0 = avoids shared memory / Bus error with workers
+    # Sampler: oversampling = balanced data; else use weighted sampler for imbalance
+    train_labels = train_df['label'].values
+    _, counts = np.unique(train_labels, return_counts=True)
+    pin_mem = use_gpu and num_workers == 0
+    if USE_OVERSAMPLING:
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=num_workers, pin_memory=pin_mem)
+    else:
+        class_weights = 1.0 / (counts + 1e-6)
+        sample_weights = class_weights[train_labels]
+        sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler, num_workers=num_workers, pin_memory=pin_mem)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=num_workers, pin_memory=pin_mem)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=num_workers, pin_memory=pin_mem)
+    test_loader_256 = DataLoader(test_ds_256, batch_size=1, shuffle=False, num_workers=0)
+    print('Train: %d, Val: %d, Test: %d' % (len(train_ds), len(val_ds), len(test_ds)))
+else:
+    train_loader = val_loader = test_loader = test_loader_256 = None
+
+
+# EDA: class distribution and sample images
+if meta is not None and len(meta) > 0:
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    # Class distribution (train)
+    train_counts = train_df['dx'].value_counts().reindex(CLASS_NAMES, fill_value=0)
+    axes[0, 0].bar(range(NUM_CLASSES), train_counts.values, color=plt.cm.tab10(np.arange(NUM_CLASSES) / 10), edgecolor='black')
+    axes[0, 0].set_xticks(range(NUM_CLASSES))
+    axes[0, 0].set_xticklabels(CLASS_NAMES, rotation=45, ha='right')
+    axes[0, 0].set_ylabel('Count')
+    axes[0, 0].set_title('Train set — class distribution')
+    axes[0, 0].grid(axis='y', alpha=0.3)
+    # Test distribution
+    test_counts = test_df['dx'].value_counts().reindex(CLASS_NAMES, fill_value=0)
+    axes[0, 1].bar(range(NUM_CLASSES), test_counts.values, color=plt.cm.tab10(np.arange(NUM_CLASSES) / 10), edgecolor='black')
+    axes[0, 1].set_xticks(range(NUM_CLASSES))
+    axes[0, 1].set_xticklabels(CLASS_NAMES, rotation=45, ha='right')
+    axes[0, 1].set_title('Test set — class distribution')
+    axes[0, 1].grid(axis='y', alpha=0.3)
+    # Sample images (from train)
+    for i in range(min(2, len(train_ds))):
+        r, c = 1 + i // 2, i % 2
+        img, label = train_ds[i]
+        if isinstance(img, torch.Tensor):
+            img = img * torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1) + torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+            img = torch.clamp(img, 0, 1).permute(1, 2, 0).numpy()
+        axes[r, c].imshow(img)
+        axes[r, c].set_title(CLASS_NAMES[label])
+        axes[r, c].axis('off')
+    plt.suptitle('HAM10000 EDA')
+    plt.tight_layout()
+    plt.show()
+    print('Train class counts:', train_df['dx'].value_counts().to_dict())
+else:
+    print('Run data load cells first.')
+
+
