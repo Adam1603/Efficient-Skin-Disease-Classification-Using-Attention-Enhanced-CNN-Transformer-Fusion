@@ -1,0 +1,699 @@
+4.	Evaluation and Testing Scripts
+A dedicated evaluation pipeline has been added, including:
+o	Accuracy, precision, recall, and F1-score computation
+o	Confusion matrix and normalized heatmap generation
+o	Support for multi-dataset evaluation
+
+# Collect test predictions with TTA (5-crop + h-flip)
+USE_TTA = True
+USE_TTA_5CROP = True   # 5-crop + h-flip = 10 views
+if test_loader is None:
+    print('No test loader. Run data cells first.')
+    y_prob = y_true = y_pred = y_bin = cm = None
+else:
+    model.eval()
+    all_probs, all_labels = [], []
+    with torch.no_grad():
+        if USE_TTA_5CROP and 'test_loader_256' in dir() and test_loader_256 is not None:
+            # 5-crop: center + 4 corners on 256x256 -> 224x224 each; + h-flip = 10 views
+            for (img, label) in test_loader_256:
+                img = img.to(device).squeeze(0)
+                c, h, w = img.shape
+                crop_sz = IMG_SIZE
+                crops = [img[:, (h-crop_sz)//2:(h+crop_sz)//2, (w-crop_sz)//2:(w+crop_sz)//2],
+                         img[:, :crop_sz, :crop_sz], img[:, :crop_sz, -crop_sz:],
+                         img[:, -crop_sz:, :crop_sz], img[:, -crop_sz:, -crop_sz:]]
+                probs_list = []
+                for cimg in crops:
+                    cimg = cimg.unsqueeze(0)
+                    p = F.softmax(model(cimg), dim=1)
+                    if USE_TTA:
+                        p = (p + F.softmax(model(torch.flip(cimg, dims=[3])), dim=1)) / 2
+                    probs_list.append(p.cpu().numpy())
+                probs = np.mean(probs_list, axis=0)
+                all_probs.append(probs)
+                all_labels.append(np.array([label.item()]))
+        else:
+            for imgs, labels in test_loader:
+                imgs = imgs.to(device, non_blocking=True)
+                logits = model(imgs)
+                probs = F.softmax(logits, dim=1)
+                if USE_TTA:
+                    probs_flip = F.softmax(model(torch.flip(imgs, dims=[3])), dim=1)
+                    probs = (probs + probs_flip) / 2
+                all_probs.append(probs.cpu().numpy())
+                all_labels.append(labels.numpy())
+    y_prob = np.vstack(all_probs)
+    y_true = np.concatenate(all_labels)
+    y_pred = np.argmax(y_prob, axis=1)
+    y_bin = label_binarize(y_true, classes=range(NUM_CLASSES))
+    cm = confusion_matrix(y_true, y_pred)
+    test_acc = 100.0 * (y_pred == y_true).mean()
+    print('='*60)
+    print('FINAL TEST ACCURACY: %.2f%%' % test_acc)
+    print('='*60)
+    print('\nClassification Report:')
+    print(classification_report(y_true, y_pred, target_names=CLASS_NAMES, digits=4))
+    # Manuscript: store predictions for McNemar / error analysis; melanoma false negatives
+    y_pred_proposed = y_pred.copy() if hasattr(y_pred, 'copy') else np.array(y_pred)
+    mel_mask = (y_true == MEL_IDX)
+    mel_fn = int(np.sum(mel_mask & (y_pred != MEL_IDX)))
+    mel_tp = int(np.sum(mel_mask & (y_pred == MEL_IDX)))
+    print('Melanoma samples: %d | TP: %d | FN (missed melanoma): %d' % (int(mel_mask.sum()), mel_tp, mel_fn))
+    metrics_last_run = detailed_classification_metrics(y_true, y_pred)
+    print_metrics_manuscript(metrics_last_run, title='Current model — balanced metrics (macro / weighted)')
+
+
+# ROC-AUC (one-vs-rest) and Precision-Recall curves
+run_eval = 'y_prob' in dir() and 'y_true' in dir() and y_prob is not None and y_true is not None
+if not run_eval:
+    print('Run the "Collect test predictions" cell first (requires test_loader).')
+else:
+    y_bin = label_binarize(y_true, classes=range(NUM_CLASSES))
+    y_pred = np.argmax(y_prob, axis=1)
+    cm = confusion_matrix(y_true, y_pred)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    # ROC
+    for i in range(NUM_CLASSES):
+        fpr, tpr, _ = roc_curve(y_bin[:, i], y_prob[:, i])
+        roc_auc_i = auc(fpr, tpr)
+        axes[0, 0].plot(fpr, tpr, lw=2, label='%s (AUC=%.3f)' % (CLASS_NAMES[i], roc_auc_i))
+    axes[0, 0].plot([0, 1], [0, 1], 'k--', lw=1)
+    axes[0, 0].set_xlabel('False Positive Rate')
+    axes[0, 0].set_ylabel('True Positive Rate')
+    axes[0, 0].set_title('ROC curves (one-vs-rest)')
+    axes[0, 0].legend(loc='lower right', fontsize=8)
+    axes[0, 0].grid(alpha=0.3)
+    tpr_macro = []
+    mean_fpr = np.linspace(0, 1, 101)
+    for i in range(NUM_CLASSES):
+        fpr, tpr, _ = roc_curve(y_bin[:, i], y_prob[:, i])
+        tpr_interp = np.interp(mean_fpr, fpr, tpr)
+        tpr_macro.append(tpr_interp)
+    mean_tpr = np.mean(tpr_macro, axis=0)
+    mean_tpr[-1] = 1.0
+    macro_auc = auc(np.linspace(0, 1, 101), mean_tpr)
+    axes[0, 1].plot(np.linspace(0, 1, 101), mean_tpr, 'b-', lw=2, label='Macro (AUC=%.3f)' % macro_auc)
+    axes[0, 1].plot([0, 1], [0, 1], 'k--')
+    axes[0, 1].set_xlabel('False Positive Rate')
+    axes[0, 1].set_ylabel('True Positive Rate')
+    axes[0, 1].set_title('Macro-averaged ROC')
+    axes[0, 1].legend()
+    axes[0, 1].grid(alpha=0.3)
+    for i in range(NUM_CLASSES):
+        prec, rec, _ = precision_recall_curve(y_bin[:, i], y_prob[:, i])
+        ap = average_precision_score(y_bin[:, i], y_prob[:, i])
+        axes[1, 0].plot(rec, prec, lw=2, label='%s (AP=%.3f)' % (CLASS_NAMES[i], ap))
+    axes[1, 0].set_xlabel('Recall')
+    axes[1, 0].set_ylabel('Precision')
+    axes[1, 0].set_title('Precision-Recall curves')
+    axes[1, 0].legend(loc='lower left', fontsize=8)
+    axes[1, 0].grid(alpha=0.3)
+    cm = confusion_matrix(y_true, y_pred)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, ax=axes[1, 1])
+    axes[1, 1].set_xlabel('Predicted')
+    axes[1, 1].set_ylabel('True')
+    axes[1, 1].set_title('Confusion Matrix')
+    acc = 100.0 * (y_pred == y_true).mean()
+    plt.suptitle('Evaluation — ROC-AUC, PR curves, Confusion Matrix (Accuracy: %.2f%%)' % acc, fontsize=12, y=1.02)
+    plt.tight_layout()
+    plt.show()
+
+
+# Normalized confusion matrix (heatmap) and classification report
+if 'y_true' not in dir() or y_true is None or 'y_pred' not in dir() or y_pred is None:
+    print('Run "Collect test predictions" cell first.')
+else:
+    cm = confusion_matrix(y_true, y_pred)
+    test_acc = 100.0 * (y_pred == y_true).mean()
+    print('Test Accuracy: %.2f%%' % test_acc)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    cm_norm = cm.astype(float) / (cm.sum(axis=1, keepdims=True) + 1e-8)
+    sns.heatmap(cm_norm, annot=True, fmt='.2f', cmap='YlOrRd', xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, ax=axes[0], vmin=0, vmax=1)
+    axes[0].set_xlabel('Predicted')
+    axes[0].set_ylabel('True')
+    axes[0].set_title('Confusion Matrix (normalized by row)')
+    axes[1].axis('off')
+    axes[1].text(0.1, 0.5, classification_report(y_true, y_pred, target_names=CLASS_NAMES), fontsize=10, family='monospace', verticalalignment='center')
+    axes[1].set_title('Classification Report')
+    plt.tight_layout()
+    plt.show()
+
+
+
+# Standard + normalized confusion matrices (manuscript figures); melanoma row highlighted
+if 'y_true' not in dir() or y_true is None or 'y_pred' not in dir() or y_pred is None:
+    print('Run "Collect test predictions" first.')
+else:
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(NUM_CLASSES)))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, ax=axes[0])
+    axes[0].set_title('Confusion matrix (counts)')
+    axes[0].set_xlabel('Predicted')
+    axes[0].set_ylabel('True')
+    with np.errstate(divide='ignore', invalid='ignore'):
+        cm_norm = cm.astype(np.float64) / (cm.sum(axis=1, keepdims=True) + 1e-12)
+    cm_norm = np.nan_to_num(cm_norm)
+    sns.heatmap(cm_norm, annot=True, fmt='.2f', cmap='YlOrRd', vmin=0, vmax=1,
+                xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, ax=axes[1])
+    axes[1].set_title('Normalized confusion matrix (recall per true class)')
+    axes[1].set_xlabel('Predicted')
+    axes[1].set_ylabel('True')
+    plt.suptitle('Error analysis — diagonal = class recall; melanoma row = %s' % CLASS_NAMES[MEL_IDX])
+    plt.tight_layout()
+    plt.show()
+
+
+# McNemar + paired prediction stats (same test order as main "Collect test predictions" cell)
+
+
+import time as _time_mcnemar
+
+AUTO_TRAIN_BASELINE_FOR_MCNEMAR = True
+
+MCNEMAR_BASELINE_EPOCHS = 80
+MCNEMAR_BASELINE_CKPT = None  # e.g. 'baseline_for_mcnemar.pt' — load if file exists, save after training
+MCNEMAR_LOG_EVERY = 5  # print val acc every N epochs (also prints epoch 1)
+
+
+def _mcnemar_collect_probs(mdl):
+    mdl.eval()
+    all_probs, all_labels = [], []
+    use_tta = globals().get('USE_TTA', True)
+    use_tta5 = globals().get('USE_TTA_5CROP', True)
+    with torch.no_grad():
+        if use_tta5 and globals().get('test_loader_256', None) is not None:
+            n_img = 0
+            for (img, label) in test_loader_256:
+                img = img.to(device).squeeze(0)
+                c, h, w = img.shape
+                crop_sz = IMG_SIZE
+                crops = [img[:, (h - crop_sz) // 2:(h + crop_sz) // 2, (w - crop_sz) // 2:(w + crop_sz) // 2],
+                         img[:, :crop_sz, :crop_sz], img[:, :crop_sz, -crop_sz:],
+                         img[:, -crop_sz:, :crop_sz], img[:, -crop_sz:, -crop_sz:]]
+                probs_list = []
+                for cimg in crops:
+                    cimg = cimg.unsqueeze(0)
+                    p = F.softmax(mdl(cimg), dim=1)
+                    if use_tta:
+                        p = (p + F.softmax(mdl(torch.flip(cimg, dims=[3])), dim=1)) / 2
+                    probs_list.append(p.cpu().numpy())
+                all_probs.append(np.mean(probs_list, axis=0))
+                all_labels.append(np.array([label.item()]))
+                n_img += 1
+                if n_img % 500 == 0:
+                    print('  McNemar eval: %d / %d test images...' % (n_img, len(test_loader_256.dataset)))
+        else:
+            for imgs, labels in test_loader:
+                imgs = imgs.to(device, non_blocking=True)
+                probs = F.softmax(mdl(imgs), dim=1)
+                if use_tta:
+                    probs = (probs + F.softmax(mdl(torch.flip(imgs, dims=[3])), dim=1)) / 2
+                all_probs.append(probs.cpu().numpy())
+                all_labels.append(labels.numpy())
+    return np.vstack(all_probs), np.concatenate(all_labels)
+
+
+def _train_baseline_resnet_mcnemar(n_epochs, save_path=None):
+    if 'build_ablation_model' in globals() and callable(globals()['build_ablation_model']):
+        baseline = build_ablation_model('baseline_cnn').to(device)
+    elif 'ResNet50Classifier' in globals():
+        baseline = ResNet50Classifier(num_classes=NUM_CLASSES, dropout=DROPOUT).to(device)
+    else:
+        raise RuntimeError('Run the model cell (ResNet50Classifier) or ablation cell (build_ablation_model).')
+    crit = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=LABEL_SMOOTHING)
+    opt = torch.optim.Adam(baseline.parameters(), lr=LEARNING_RATE, betas=(0.9, 0.999), weight_decay=WEIGHT_DECAY)
+    sched = torch.optim.lr_scheduler.OneCycleLR(
+        opt, max_lr=LEARNING_RATE, epochs=n_epochs, steps_per_epoch=len(train_loader), pct_start=0.1)
+    use_amp = USE_AMP and torch.cuda.is_available()
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    best_val, best_state = 0.0, None
+    patience_ct = 0
+    _ttrain = _time_mcnemar.time()
+    for epoch in range(n_epochs):
+        baseline.train()
+        for imgs, labels in train_loader:
+            imgs, labels = imgs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+            opt.zero_grad()
+            if use_amp:
+                with torch.cuda.amp.autocast():
+                    loss = crit(baseline(imgs), labels)
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(baseline.parameters(), max_norm=1.0)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss = crit(baseline(imgs), labels)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(baseline.parameters(), max_norm=1.0)
+                opt.step()
+            sched.step()
+        baseline.eval()
+        correct_v, total_v = 0, 0
+        with torch.no_grad():
+            for imgs, labels in val_loader:
+                imgs, labels = imgs.to(device), labels.to(device)
+                _, pred = baseline(imgs).max(1)
+                total_v += labels.size(0)
+                correct_v += (pred == labels).sum().item()
+        val_acc = 100.0 * correct_v / max(total_v, 1)
+        if val_acc > best_val:
+            best_val = val_acc
+            best_state = {k: v.cpu().clone() for k, v in baseline.state_dict().items()}
+            patience_ct = 0
+        else:
+            patience_ct += 1
+        if epoch == 0 or (epoch + 1) % max(1, MCNEMAR_LOG_EVERY) == 0 or epoch + 1 == n_epochs:
+            print('  [McNemar baseline] epoch %d/%d | val %.2f%% | best %.2f%% | %.1f min elapsed' % (
+                epoch + 1, n_epochs, val_acc, best_val, (_time_mcnemar.time() - _ttrain) / 60.0))
+        if patience_ct >= PATIENCE:
+            print('  McNemar baseline: early stop at epoch %d (best val %.2f%%)' % (epoch + 1, best_val))
+            break
+    if best_state is not None:
+        baseline.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+    if save_path:
+        torch.save(baseline.state_dict(), save_path)
+        print('Saved baseline weights to', save_path)
+    return baseline
+
+
+_ready = ('y_true' in globals() and y_true is not None and 'y_pred' in globals() and y_pred is not None
+          and test_loader is not None and 'mcnemar_test' in globals())
+
+_mcnemar_t0 = _time_mcnemar.time()
+_mcnemar_status = 'skipped (prerequisites missing)'
+
+if not _ready:
+    print('Need y_true, y_pred from "Collect test predictions", test_loader, and mcnemar_test helper.')
+else:
+    _ypb = globals().get('y_pred_baseline', None)
+    if _ypb is None and AUTO_TRAIN_BASELINE_FOR_MCNEMAR:
+        try:
+            ckpt = MCNEMAR_BASELINE_CKPT
+            if ckpt and os.path.isfile(ckpt):
+                if 'build_ablation_model' in globals() and callable(globals()['build_ablation_model']):
+                    baseline_m = build_ablation_model('baseline_cnn').to(device)
+                else:
+                    baseline_m = ResNet50Classifier(num_classes=NUM_CLASSES, dropout=DROPOUT).to(device)
+                baseline_m.load_state_dict(torch.load(ckpt, map_location=device))
+                baseline_m.eval()
+                print('Loaded McNemar baseline from', ckpt)
+                _mcnemar_status = 'loaded checkpoint; evaluating...'
+            else:
+                print('Training ResNet50 baseline for McNemar (max %d epochs; set MCNEMAR_BASELINE_EPOCHS = EPOCHS_SINGLE for 80)...' % MCNEMAR_BASELINE_EPOCHS)
+                baseline_m = _train_baseline_resnet_mcnemar(MCNEMAR_BASELINE_EPOCHS, save_path=ckpt)
+                _mcnemar_status = 'trained baseline; evaluating...'
+            print('Collecting baseline predictions on test set (TTA may take several minutes)...')
+            y_prob_baseline, y_true_b = _mcnemar_collect_probs(baseline_m)
+            y_pred_baseline = np.argmax(y_prob_baseline, axis=1)
+            if not np.array_equal(y_true_b, y_true):
+                print('ERROR: test set label order differs from main run — do not trust McNemar (check test_loader_256 shuffle).')
+                y_pred_baseline = None
+                _mcnemar_status = 'failed (y_true mismatch)'
+            else:
+                print('Baseline accuracy (same test set): %.2f%%' % (100.0 * (y_pred_baseline == y_true).mean()))
+                _mcnemar_status = 'baseline predictions ready'
+            del baseline_m
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as _e:
+            print('Auto baseline for McNemar failed:', repr(_e))
+            y_pred_baseline = None
+            _mcnemar_status = 'failed: ' + repr(_e)
+    elif _ypb is None:
+        print('y_pred_baseline not set. Enable AUTO_TRAIN_BASELINE_FOR_MCNEMAR=True or train a baseline and assign y_pred_baseline.')
+        _mcnemar_status = 'no y_pred_baseline'
+
+    if globals().get('y_pred_baseline') is not None:
+        _yprop = globals().get('y_pred_proposed', y_pred)
+        mc = mcnemar_test(y_true, _yprop, y_pred_baseline)
+        print('McNemar (proposed vs baseline):', mc)
+        if mc['p_chi2'] < 0.05 or (isinstance(mc.get('p_exact_two_sided'), float) and mc['p_exact_two_sided'] < 0.05):
+            print('>>> p < 0.05: discordant errors differ — models differ significantly (McNemar).')
+        else:
+            print('>>> p >= 0.05: not enough evidence of different marginal error rates (or low power).')
+        _mcnemar_status = 'McNemar computed'
+    else:
+        if _ready:
+            print('No McNemar statistic: y_pred_baseline is missing after this cell.')
+
+_elapsed = (_time_mcnemar.time() - _mcnemar_t0) / 60.0
+print('\n=== McNemar cell finished: %s (%.1f min total) ===' % (_mcnemar_status, _elapsed))
+
+
+
+# --- Multi-seed validation: mean ± std, paired t-test & Wilcoxon (same seeds for both models) ---
+# Each run: new stratified split + oversampling + train A + train B. Very expensive at 80 epochs × 2 models × N seeds.
+NUM_STAT_RUNS = 3
+STAT_SEEDS = [42, 123, 456]
+ABLATION_A = 'cnn_transformer_with_attention'
+ABLATION_B = 'baseline_cnn'
+
+RUN_MULTI_SEED_EXPERIMENT = True  # set False to skip (saves time when iterating)
+MULTI_SEED_MAX_EPOCHS = 80  
+
+def _clone_state(m):
+    return {k: v.cpu().clone() for k, v in m.state_dict().items()}
+
+def train_eval_seed_ablation(seed, ablation_name, train_loader, val_loader, test_loader, test_loader_256, max_epochs=None):
+    """Train one model; return test accuracy (fraction), melanoma recall, preds, y_true."""
+    use_tta = globals().get('USE_TTA', True)
+    use_tta5 = globals().get('USE_TTA_5CROP', True)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    bab = globals().get('build_ablation_model')
+    if bab is None or not callable(bab):
+        raise RuntimeError('Run the ablation cell so build_ablation_model exists.')
+    model_local = bab(ablation_name).to(device)
+    all_labels = []
+    for _, labels in train_loader:
+        all_labels.extend(labels.tolist())
+    _, counts = np.unique(all_labels, return_counts=True)
+    beta = 0.9999
+    effective_num = 1.0 - np.power(beta, counts.astype(float))
+    cw = (1.0 - beta) / (effective_num + 1e-8)
+    cw = torch.tensor(cw, dtype=torch.float32, device=device)
+    cw = cw / cw.sum() * NUM_CLASSES
+    crit = nn.CrossEntropyLoss(weight=cw, label_smoothing=LABEL_SMOOTHING)
+    opt = torch.optim.Adam(model_local.parameters(), lr=LEARNING_RATE, betas=(0.9, 0.999), weight_decay=WEIGHT_DECAY)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='max', factor=0.5, patience=LR_PATIENCE, verbose=False)
+    use_amp = USE_AMP and torch.cuda.is_available()
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    best_val, best_state = 0.0, None
+    patience_ct = 0
+    n_epochs = max_epochs if max_epochs is not None else EPOCHS_SINGLE
+    for epoch in range(n_epochs):
+        model_local.train()
+        for imgs, labels in train_loader:
+            imgs, labels = imgs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+            opt.zero_grad()
+            if use_amp:
+                with torch.cuda.amp.autocast():
+                    logits = model_local(imgs)
+                    loss = crit(logits, labels)
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model_local.parameters(), 1.0)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                logits = model_local(imgs)
+                loss = crit(logits, labels)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model_local.parameters(), 1.0)
+                opt.step()
+        model_local.eval()
+        correct_v = total_v = 0
+        with torch.no_grad():
+            for imgs, labels in val_loader:
+                imgs, labels = imgs.to(device), labels.to(device)
+                _, pr = model_local(imgs).max(1)
+                total_v += labels.size(0)
+                correct_v += (pr == labels).sum().item()
+        val_acc = 100.0 * correct_v / max(total_v, 1)
+        sched.step(val_acc)
+        if val_acc > best_val:
+            best_val, best_state, patience_ct = val_acc, _clone_state(model_local), 0
+        else:
+            patience_ct += 1
+        if (epoch + 1) % max(1, min(10, n_epochs)) == 0 or epoch == 0 or epoch + 1 == n_epochs:
+            print('    [%s] ep %d/%d val %.2f%% best %.2f%%' % (ablation_name, epoch + 1, n_epochs, val_acc, best_val))
+        if patience_ct >= PATIENCE:
+            print('    [%s] early stop ep %d (best val %.2f%%)' % (ablation_name, epoch + 1, best_val))
+            break
+    if best_state is not None:
+        model_local.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+    model_local.eval()
+    all_probs, all_labels = [], []
+    with torch.no_grad():
+        if use_tta5 and test_loader_256 is not None:
+            for (img, label) in test_loader_256:
+                img = img.to(device).squeeze(0)
+                c, h, w = img.shape
+                crop_sz = IMG_SIZE
+                crops = [img[:, (h-crop_sz)//2:(h+crop_sz)//2, (w-crop_sz)//2:(w+crop_sz)//2],
+                         img[:, :crop_sz, :crop_sz], img[:, :crop_sz, -crop_sz:],
+                         img[:, -crop_sz:, :crop_sz], img[:, -crop_sz:, -crop_sz:]]
+                probs_list = []
+                for cimg in crops:
+                    cimg = cimg.unsqueeze(0)
+                    p = F.softmax(model_local(cimg), dim=1)
+                    if use_tta:
+                        p = (p + F.softmax(model_local(torch.flip(cimg, dims=[3])), dim=1)) / 2
+                    probs_list.append(p.cpu().numpy())
+                all_probs.append(np.mean(probs_list, axis=0))
+                all_labels.append(np.array([label.item()]))
+        else:
+            for imgs, labels in test_loader:
+                imgs = imgs.to(device, non_blocking=True)
+                logits = model_local(imgs)
+                probs = F.softmax(logits, dim=1)
+                if use_tta:
+                    probs = (probs + F.softmax(model_local(torch.flip(imgs, dims=[3])), dim=1)) / 2
+                all_probs.append(probs.cpu().numpy())
+                all_labels.append(labels.numpy())
+    yp = np.vstack(all_probs)
+    yt = np.concatenate(all_labels)
+    pred = np.argmax(yp, axis=1)
+    acc = float((pred == yt).mean())
+    mel_rec = detailed_classification_metrics(yt, pred)['melanoma_sensitivity_recall']
+    del model_local
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return acc, mel_rec, pred, yt
+
+if not RUN_MULTI_SEED_EXPERIMENT:
+    print('Multi-seed experiment is OFF (RUN_MULTI_SEED_EXPERIMENT=False).')
+elif meta is None:
+    print('Multi-seed skipped: meta is None — load HAM10000 data first.')
+else:
+    assert len(STAT_SEEDS) >= NUM_STAT_RUNS, 'STAT_SEEDS must have length >= NUM_STAT_RUNS'
+    print('Multi-seed: %d runs; max %d epochs/model; A=%s B=%s' % (
+        NUM_STAT_RUNS, MULTI_SEED_MAX_EPOCHS, ABLATION_A, ABLATION_B))
+    accs_a, accs_b, mels_a, mels_b = [], [], [], []
+    for si in range(NUM_STAT_RUNS):
+        s = STAT_SEEDS[si]
+        print('=== Multi-seed run %d / %d | seed=%s ===' % (si + 1, NUM_STAT_RUNS, s))
+        tr_df, te_df = train_test_split(meta, test_size=1 - TRAIN_RATIO, stratify=meta['label'], random_state=s)
+        tr_df, va_df = train_test_split(tr_df, test_size=VAL_RATIO, stratify=tr_df['label'], random_state=s)
+        counts = tr_df['label'].value_counts()
+        target = int(counts.max())
+        train_dfs = []
+        for lbl in range(NUM_CLASSES):
+            sub = tr_df[tr_df['label'] == lbl]
+            if len(sub) < target:
+                sub = pd.concat([sub, sub.sample(n=target - len(sub), replace=True, random_state=s)], ignore_index=True)
+            train_dfs.append(sub)
+        tr_df = pd.concat(train_dfs, ignore_index=True).sample(frac=1, random_state=s).reset_index(drop=True)
+        pin_mem = torch.cuda.is_available()
+        nw = 0
+        tr_ds = HAM10000Dataset(tr_df, transform=train_transform)
+        va_ds = HAM10000Dataset(va_df, transform=test_transform)
+        te_ds = HAM10000Dataset(te_df, transform=test_transform)
+        tta_sz = 256 if IMG_SIZE >= 224 else 160
+        test_transform_256 = transforms.Compose([transforms.Resize(tta_sz, interpolation=interp), transforms.ToTensor(), transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+        te_ds256 = HAM10000Dataset(te_df, transform=test_transform_256)
+        tl = DataLoader(tr_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=nw, pin_memory=pin_mem and nw == 0)
+        vl = DataLoader(va_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=nw, pin_memory=pin_mem and nw == 0)
+        tel = DataLoader(te_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=nw, pin_memory=pin_mem and nw == 0)
+        tel256 = DataLoader(te_ds256, batch_size=1, shuffle=False, num_workers=0)
+        a_acc, a_mel, _, yt = train_eval_seed_ablation(s, ABLATION_A, tl, vl, tel, tel256, max_epochs=MULTI_SEED_MAX_EPOCHS)
+        b_acc, b_mel, _, _ = train_eval_seed_ablation(s + 100000, ABLATION_B, tl, vl, tel, tel256, max_epochs=MULTI_SEED_MAX_EPOCHS)
+        accs_a.append(a_acc)
+        accs_b.append(b_acc)
+        mels_a.append(a_mel)
+        mels_b.append(b_mel)
+        print('  Proposed acc=%.4f mel_rec=%.4f | Baseline acc=%.4f mel_rec=%.4f' % (a_acc, a_mel, b_acc, b_mel))
+    accs_a, accs_b = np.array(accs_a), np.array(accs_b)
+    mels_a, mels_b = np.array(mels_a), np.array(mels_b)
+    print('\n*** Statistical validation across %d runs ***' % NUM_STAT_RUNS)
+    print('Proposed  accuracy: mean=%.4f std=%.4f' % (accs_a.mean(), accs_a.std(ddof=1) if len(accs_a) > 1 else 0.0))
+    print('Baseline  accuracy: mean=%.4f std=%.4f' % (accs_b.mean(), accs_b.std(ddof=1) if len(accs_b) > 1 else 0.0))
+    print('Proposed  melanoma recall: mean=%.4f std=%.4f' % (mels_a.mean(), mels_a.std(ddof=1) if len(mels_a) > 1 else 0.0))
+    print('Baseline  melanoma recall: mean=%.4f std=%.4f' % (mels_b.mean(), mels_b.std(ddof=1) if len(mels_b) > 1 else 0.0))
+    if len(accs_a) > 1:
+        t_stat, p_t = scipy_stats.ttest_rel(accs_a, accs_b)
+        try:
+            w_stat, p_w = scipy_stats.wilcoxon(accs_a, accs_b)
+        except Exception:
+            p_w = float('nan')
+        print('Paired t-test on accuracy (A vs B): t=%.4f p=%.6f' % (t_stat, p_t))
+        print('Wilcoxon signed-rank: p=%.6f' % p_w)
+        if p_t < 0.05:
+            print('>>> p < 0.05 on paired t-test: mean accuracy gain is statistically significant.')
+        else:
+            print('>>> Paired t-test p >= 0.05 (may need more runs or check variance).')
+    print('=== Multi-seed block finished ===')
+
+
+
+# --- k-fold cross-validation + Friedman test on fold accuracies ---
+from sklearn.model_selection import StratifiedKFold
+
+RUN_KFOLD_ANALYSIS = True  # set False to skip
+N_FOLDS = 5  
+KFOLD_MAX_EPOCHS = 80  
+KFOLD_MODEL_NAMES = ['baseline_cnn', 'cnn_transformer_with_attention']  # add more for Friedman (needs >= 3 models)
+
+if not RUN_KFOLD_ANALYSIS:
+    print('K-fold experiment is OFF (RUN_KFOLD_ANALYSIS=False).')
+elif meta is None:
+    print('K-fold skipped: meta is None — load HAM10000 data first.')
+elif 'train_eval_seed_ablation' not in globals():
+    print('K-fold skipped: run the multi-seed cell first (defines train_eval_seed_ablation).')
+else:
+    print('K-fold: %d folds | max %d epochs per model per fold | %s' % (N_FOLDS, KFOLD_MAX_EPOCHS, KFOLD_MODEL_NAMES))
+    X_idx = np.arange(len(meta))
+    y_lab = meta['label'].values
+    kf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+    fold_scores = {m: [] for m in KFOLD_MODEL_NAMES}
+    for fold_id, (tr_idx, te_idx) in enumerate(kf.split(X_idx, y_lab)):
+        print('--- Fold %d / %d ---' % (fold_id + 1, N_FOLDS))
+        tr_meta = meta.iloc[tr_idx].reset_index(drop=True)
+        te_meta = meta.iloc[te_idx].reset_index(drop=True)
+        tr_df, va_df = train_test_split(tr_meta, test_size=VAL_RATIO, stratify=tr_meta['label'], random_state=RANDOM_SEED + fold_id)
+        counts = tr_df['label'].value_counts()
+        target = int(counts.max())
+        train_dfs = []
+        for lbl in range(NUM_CLASSES):
+            sub = tr_df[tr_df['label'] == lbl]
+            if len(sub) < target:
+                sub = pd.concat([sub, sub.sample(n=target - len(sub), replace=True, random_state=RANDOM_SEED)], ignore_index=True)
+            train_dfs.append(sub)
+        tr_df = pd.concat(train_dfs, ignore_index=True).sample(frac=1, random_state=RANDOM_SEED).reset_index(drop=True)
+        nw = 0
+        pin_mem = torch.cuda.is_available()
+        tr_ds = HAM10000Dataset(tr_df, transform=train_transform)
+        va_ds = HAM10000Dataset(va_df, transform=test_transform)
+        te_ds = HAM10000Dataset(te_meta, transform=test_transform)
+        tta_sz = 256 if IMG_SIZE >= 224 else 160
+        tt256 = transforms.Compose([transforms.Resize(tta_sz, interpolation=interp), transforms.ToTensor(), transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+        te_ds256 = HAM10000Dataset(te_meta, transform=tt256)
+        tl = DataLoader(tr_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=nw, pin_memory=pin_mem and nw == 0)
+        vl = DataLoader(va_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=nw, pin_memory=pin_mem and nw == 0)
+        tel = DataLoader(te_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=nw, pin_memory=pin_mem and nw == 0)
+        tel256 = DataLoader(te_ds256, batch_size=1, shuffle=False, num_workers=0)
+        for mname in KFOLD_MODEL_NAMES:
+            acc, mel, _, _ = train_eval_seed_ablation(RANDOM_SEED + fold_id, mname, tl, vl, tel, tel256, max_epochs=KFOLD_MAX_EPOCHS)
+            fold_scores[mname].append(acc)
+            print('  %s fold acc=%.4f' % (mname, acc))
+    # Friedman: rows = folds, cols = models
+    mat = np.column_stack([fold_scores[m] for m in KFOLD_MODEL_NAMES])
+    if mat.shape[1] >= 3:
+        stat_fr, p_fr = scipy_stats.friedmanchisquare(*[mat[:, j] for j in range(mat.shape[1])])
+        print('Friedman test across models:', stat_fr, p_fr)
+    else:
+        print('Friedman needs >= 3 models; got %d. Use pairwise paired tests for two models.' % mat.shape[1])
+    if mat.shape[1] == 2 and mat.shape[0] > 1:
+        t_stat, p_t = scipy_stats.ttest_rel(mat[:, 0], mat[:, 1])
+        print('Paired t-test on fold accuracies (%s vs %s): p=%.6f' % (KFOLD_MODEL_NAMES[0], KFOLD_MODEL_NAMES[1], p_t))
+    print('=== K-fold block finished ===')
+
+
+
+
+
+# Training history (loss and accuracy curves)
+if 'history' in dir() and history:
+    fig, ax = plt.subplots(1, 2, figsize=(12, 4))
+    ax[0].plot(history['train_loss'], label='Train')
+    ax[0].plot(history['val_loss'], label='Val')
+    ax[0].set_title('Loss')
+    ax[0].legend()
+    ax[0].grid(alpha=0.3)
+    ax[1].plot(history['train_acc'], label='Train')
+    ax[1].plot(history['val_acc'], label='Val')
+    ax[1].set_title('Accuracy (%)')
+    ax[1].legend()
+    ax[1].grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+# Grad-CAM: gradients of target score w.r.t. last conv feature map
+# (Uses torch.autograd.grad — avoids feat.grad being None on intermediate tensors.)
+
+def _gradcam_hook_module(model):
+    if not hasattr(model, 'backbone'):
+        return None
+    bb = model.backbone
+    if isinstance(bb, nn.Sequential):
+        children = list(bb.children())
+        return children[-1] if children else None
+    if hasattr(bb, 'layer4'):
+        return bb.layer4
+    if hasattr(bb, 'features'):
+        f = bb.features
+        if isinstance(f, nn.Sequential) and len(f) > 0:
+            return f[-1]
+        return f
+    return bb
+
+
+def grad_cam_heatmap(model, img_tensor, target_class=None, device=None):
+    if device is None:
+        device = next(model.parameters()).device
+    elif isinstance(device, str):
+        device = torch.device(device)
+    hook_mod = _gradcam_hook_module(model)
+    if hook_mod is None:
+        return None, None
+    model.eval()
+    if img_tensor.dim() == 3:
+        img_tensor = img_tensor.unsqueeze(0)
+    img_tensor = img_tensor.to(device).detach().clone().requires_grad_(True)
+    activations = []
+
+    def hook_fn(module, inp, out):
+        activations.clear()
+        activations.append(out)
+
+    handle = hook_mod.register_forward_hook(hook_fn)
+    logits = model(img_tensor)
+    handle.remove()
+    if not activations:
+        return None, None
+    feat = activations[0]
+    if target_class is None:
+        target_class = int(logits.argmax(dim=1).item())
+    score = logits[0, target_class]
+    grads = torch.autograd.grad(score, feat, retain_graph=False, allow_unused=True)[0]
+    if grads is None:
+        return None, target_class
+    weights = grads.mean(dim=(2, 3), keepdim=True)
+    cam = (weights * feat).sum(dim=1).squeeze(0)
+    cam = F.relu(cam)
+    cam = cam.detach()
+    cam = cam / (cam.max() + 1e-8)
+    cam = cam.unsqueeze(0).unsqueeze(0)
+    cam = F.interpolate(cam, size=(IMG_SIZE, IMG_SIZE), mode='bilinear', align_corners=False)
+    cam = cam.squeeze().cpu().numpy()
+    return cam, target_class
+
+
+# Plot Grad-CAM heatmaps for sample test images
+if test_loader is None or 'test_ds' not in dir() or 'model' not in dir():
+    print('Run data cells and model/training first.')
+else:
+    n_show = min(6, len(test_ds))
+    fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+    for i in range(n_show):
+        img, label = test_ds[i]
+        model.eval()
+        with torch.enable_grad():
+            cam, pred_cls = grad_cam_heatmap(model, img, target_class=label, device=str(device))
+        if cam is None:
+            cam = np.zeros((IMG_SIZE, IMG_SIZE))
+        r, c = i // 3, i % 3
+        img_np = img * torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1) + torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        img_np = torch.clamp(img_np, 0, 1).permute(1, 2, 0).numpy()
+        axes[r, c].imshow(img_np)
+        axes[r, c].imshow(cam, alpha=0.5, cmap='jet')
+        axes[r, c].set_title('True: %s' % CLASS_NAMES[label])
+        axes[r, c].axis('off')
+    plt.suptitle('Grad-CAM Heatmaps — attention overlay (target = true class)')
+    plt.tight_layout()
+    plt.show()
+
