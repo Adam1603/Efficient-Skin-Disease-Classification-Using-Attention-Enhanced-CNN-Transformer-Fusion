@@ -20,15 +20,57 @@ Activation	    ReLU
 Dropout	        0.35
 
 
-o	Step-by-step instructions to reproduce results
+o	**Step-by-step instructions to reproduce results**
 
  Outputs: EDA, ROC-AUC, PR curves, confusion matrices, and heatmaps.
 
-o	Environment setup and dependency requirements
+o	**Environment setup and dependency requirements**
 
+PyTorch: 2.7.0a0+7c8ec84dab.nv25.03
+CUDA available: True
+GPU: NVIDIA B200 MIG 1g.45gb
+CUDA version: 12.8
 
-o	Dataset access instructions
+o	**Dataset access instructions**
 
 Dataset: 1. ISIC2026 2. ISIC2017 3. HAM10000 - (70% train / 30% test).
 
-o	Clear explanation of folder structure and code organization
+Class-Wise Distribution:
+ISIC2016 dataset-
+Benign	1031 images
+Malignant	248 images
+
+the ISIC2016 dataset link is https://www.kaggle.com/datasets/mahmudulhasantasin/isic-2016-original-dataset
+
+ISIC2017 DATASET
+
+Nevus (Benign): 1,843 images
+Melanoma (Malignant): 521 images
+Seborrheic Keratosis (Benign): 386 images
+
+https://www.kaggle.com/datasets/johnchfr/isic-2017
+
+HAM10000 dataset -
+Melanocytic nevi (nv): 6,705 images
+Melanoma (mel): 1,113 images
+Benign keratosis-like lesions (bkl): 1,099 images
+Basal cell carcinoma (bcc): 514 images
+Actinic keratoses and intraepithelial carcinoma (akiec): 327 images
+Vascular lesions (vasc): 142 images
+Dermatofibroma (df): 115 images
+
+Link: https://www.kaggle.com/datasets/kmader/skin-cancer-mnist-ham10000
+
+o	**Clear explanation of folder structure and code organization**
+
+Ablation taxonomy (expanded code / experimental design):
+
+Setting	Description
+baseline_cnn	-Strong CNN-only baseline (ResNet50 classifier head).
+cnn_backbone_gap_only-	Same ResNet trunk as hybrid + GAP + head — no CBAM, no Transformer (ablation).
+cnn_cbam_gap_only	-ResNet trunk + CBAM + GAP + head — no Transformer (attention on CNN features only).
+transformer_only	-Pure Transformer on image patches (no ResNet trunk).
+cnn_transformer_no_attention	-ResNet + Transformer without CBAM (no channel/spatial attention).
+cnn_transformer_with_attention	-Proposed ResNet + CBAM + Transformer (use_cbam=True, default hybrid).
+proposed_with_fusion_refine	-Proposed + feature fusion refinement MLP before the classifier head.
+proposed_no_fusion_refine	-Proposed hybrid without the refinement MLP.
