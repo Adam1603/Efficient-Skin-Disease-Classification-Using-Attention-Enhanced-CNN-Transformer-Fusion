@@ -31,6 +31,9 @@ CUDA available: True
 GPU: NVIDIA B200 MIG 1g.45gb
 CUDA version: 12.8
 
+Device: CUDA — NVIDIA B200 MIG 1g.45gb (training will be fast)
+Model parameters: 23522375
+
 o	**Dataset access instructions**
 
 Dataset: 1. ISIC2026 2. ISIC2017 3. HAM10000 - (70% train / 30% test).
