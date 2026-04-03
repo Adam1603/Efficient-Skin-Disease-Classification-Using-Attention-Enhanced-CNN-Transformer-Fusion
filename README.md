@@ -22,7 +22,20 @@ Dropout	        0.35
 
 o	**Step-by-step instructions to reproduce results**
 
- Outputs: EDA, ROC-AUC, PR curves, confusion matrices, and heatmaps.
+1. oversampling = balanced data; else use weighted sampler for imbalance
+2. EDA: class distribution and sample images
+3. Outputs: EDA, ROC-AUC, PR curves, confusion matrices, and heatmaps.
+4. ABLATION_REGISTRY: names -> constructor kwargs for HybridResNetTransformer
+5. Training loop — with early stopping, LR scheduler, best model checkpoint, AMP
+6. Collect test predictions with TTA (5-crop + h-flip )
+7. ROC-AUC (one-vs-rest) and Precision-Recall curves
+8. Normalized confusion matrix (heatmap) and classification report
+9. Standard + normalized confusion matrices ; melanoma row highlighted
+10. McNemar + paired prediction stats
+11. Multi-seed validation: mean ± std, paired t-test & Wilcoxon
+12. k-fold cross-validation + Friedman test on fold accuracie
+13. Grad-CAM: gradients of target score w.r.t. last conv feature map
+
 
 o	**Environment setup and dependency requirements**
 
@@ -31,7 +44,7 @@ CUDA available: True
 GPU: NVIDIA B200 MIG 1g.45gb
 CUDA version: 12.8
 
-Device: CUDA — NVIDIA B200 MIG 1g.45gb (training will be fast)
+Device: CUDA — NVIDIA B200 MIG 1g.45gb 
 Model parameters: 23522375
 
 o	**Dataset access instructions**
