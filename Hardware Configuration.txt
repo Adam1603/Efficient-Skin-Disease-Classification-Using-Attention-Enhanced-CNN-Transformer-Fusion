@@ -1,4 +1,0 @@
-GPU: NVIDIA B200 MIG 1g.45gb
-RAM: 45 GB of HBM3e GPU memory (RAM) 
-OS: DGX OS (Ubuntu Linux)
-
