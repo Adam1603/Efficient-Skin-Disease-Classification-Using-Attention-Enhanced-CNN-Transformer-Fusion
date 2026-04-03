@@ -12,7 +12,7 @@ USE_AMP = True
 USE_EFFICIENTNET = False
 USE_RESNET34_FAST = False
 USE_RESNET18_FAST = False
-USE_RESNET50_ACCURACY = True   # ResNet50 for 98%%
+USE_RESNET101_ACCURACY = True   
 USE_RESNET50 = False
 DROPOUT = 0.3
 MIXUP_ALPHA = 0.2
@@ -52,8 +52,8 @@ test_transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
 ])
-print('Config: LR=%.4f, ResNet50=%s, img=%d, batch=%d, epochs=%d (98%% target)' % (
-    LEARNING_RATE, USE_RESNET50_ACCURACY, IMG_SIZE, BATCH_SIZE, EPOCHS_SINGLE))
+print('Config: LR=%.4f, ResNet101=%s, img=%d, batch=%d, epochs=%d (98%% target)' % (
+    LEARNING_RATE, USE_RESNET101_ACCURACY, IMG_SIZE, BATCH_SIZE, EPOCHS_SINGLE))
 
 
 
