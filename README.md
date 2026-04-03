@@ -90,3 +90,17 @@ cnn_transformer_no_attention	-ResNet + Transformer without CBAM (no channel/spat
 cnn_transformer_with_attention	-Proposed ResNet + CBAM + Transformer (use_cbam=True, default hybrid).
 proposed_with_fusion_refine	-Proposed + feature fusion refinement MLP before the classifier head.
 proposed_no_fusion_refine	-Proposed hybrid without the refinement MLP.
+
+1. DataPreprocessing Pipeline-   detailed preprocessing scripts, including image resizing, normalization, augmentation techniques
+2. Training Pipeline- o	Model architecture definitions
+o	Hyperparameter settings (learning rate, batch size, optimizer, epochs, etc.)
+o	Training procedures for both individual models and the fusion framework
+o	Random seed initialization to ensure reproducibility
+3. 3.	Evaluation and Testing - o	Accuracy, precision, recall, and F1-score computation
+o	Confusion matrix and normalized heatmap generation
+o	Support for multi-dataset evaluation
+4. 4.	README- o	Step-by-step instructions to reproduce results
+o	Environment setup and dependency requirements
+o	Dataset access instructions
+
+
