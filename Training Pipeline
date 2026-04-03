@@ -163,14 +163,14 @@ class EfficientNetClassifier(nn.Module):
         return self.backbone(x)
 
 
-class ResNet50Classifier(nn.Module):
+class ResNet101Classifier(nn.Module):
    
     def __init__(self, num_classes=NUM_CLASSES, dropout=0.3):
         super().__init__()
         try:
-            resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+            resnet = models.resnet101(weights=models.ResNet101_Weights.IMAGENET1K_V1)
         except AttributeError:
-            resnet = models.resnet50(pretrained=True)
+            resnet = models.resnet101(pretrained=True)
         in_features = resnet.fc.in_features
         resnet.fc = nn.Sequential(nn.Dropout(p=dropout), nn.Linear(in_features, num_classes))
         self.backbone = resnet
@@ -183,7 +183,7 @@ class ResNet50Classifier(nn.Module):
 
 # ABLATION_REGISTRY: names -> constructor kwargs for HybridResNetTransformer (and special cases)
 ABLATION_REGISTRY = {
-    'baseline_cnn': {'kind': 'resnet50'},
+    'baseline_cnn': {'kind': 'resnet101'},
     'cnn_backbone_gap_only': {'kind': 'hybrid', 'use_cbam': False, 'use_transformer': False, 'use_fusion_refinement': False},
     'cnn_cbam_gap_only': {'kind': 'hybrid', 'use_cbam': True, 'use_transformer': False, 'use_fusion_refinement': False},
     'transformer_only': {'kind': 'transformer_only'},
@@ -229,8 +229,8 @@ def build_ablation_model(name, dropout=None):
     if cfg is None:
         raise ValueError('Unknown ablation %r. Choose one of: %s' % (name, list(ABLATION_REGISTRY.keys())))
     kind = cfg['kind']
-    if kind == 'resnet50':
-        return ResNet50Classifier(num_classes=NUM_CLASSES, dropout=d)
+    if kind == 'resnet101':
+        return ResNet101Classifier(num_classes=NUM_CLASSES, dropout=d)
     if kind == 'transformer_only':
         return TransformerOnlySkin(num_classes=NUM_CLASSES, dropout=d, mlp_dim=1024, depth=4, heads=8, patch_size=16, img_size=IMG_SIZE)
     if kind == 'hybrid':
@@ -351,9 +351,9 @@ if USE_FOCAL_LOSS:
     criterion = FocalLoss(weight=class_weights, gamma=FOCAL_GAMMA)
 else:
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=LABEL_SMOOTHING)
-# Model: ResNet50 (98%%), ResNet18, ResNet34, EfficientNet, or Hybrid ResNet+Transformer
-if USE_RESNET50_ACCURACY:
-    model = ResNet50Classifier(num_classes=NUM_CLASSES, dropout=DROPOUT).to(device)
+# Model: ResNet101, ResNet18, ResNet34, EfficientNet, or Hybrid ResNet+Transformer
+if USE_RESNET101_ACCURACY:
+    model = ResNet101Classifier(num_classes=NUM_CLASSES, dropout=DROPOUT).to(device)
 elif USE_RESNET18_FAST:
     model = ResNet18Classifier(num_classes=NUM_CLASSES, dropout=DROPOUT).to(device)
 elif USE_RESNET34_FAST:
@@ -373,7 +373,7 @@ else:
             transformer_heads=8, transformer_mlp_dim=1024, transformer_dropout=DROPOUT, head_dropout=DROPOUT,
         ).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, betas=(0.9, 0.999), weight_decay=WEIGHT_DECAY)
-if (USE_RESNET50_ACCURACY or USE_RESNET18_FAST or USE_RESNET34_FAST or USE_EFFICIENTNET) and train_loader is not None:
+if (USE_RESNET101_ACCURACY or USE_RESNET18_FAST or USE_RESNET34_FAST or USE_EFFICIENTNET) and train_loader is not None:
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=LEARNING_RATE, epochs=EPOCHS_SINGLE, steps_per_epoch=len(train_loader), pct_start=0.1)
 else:
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=LR_PATIENCE, verbose=True)
@@ -397,7 +397,7 @@ else:
     WARMUP_EPOCHS = 5
     for epoch in range(n_epochs):
         # LR warmup (skip for OneCycleLR which has built-in warmup)
-        if not (USE_RESNET50_ACCURACY or USE_RESNET18_FAST or USE_RESNET34_FAST or USE_EFFICIENTNET) and epoch < WARMUP_EPOCHS:
+        if not (USE_RESNET101_ACCURACY or USE_RESNET18_FAST or USE_RESNET34_FAST or USE_EFFICIENTNET) and epoch < WARMUP_EPOCHS:
             for pg in optimizer.param_groups:
                 pg['lr'] = LEARNING_RATE * (epoch + 1) / WARMUP_EPOCHS
         model.train()
@@ -440,7 +440,7 @@ else:
                     scaler.update()
                 else:
                     optimizer.step()
-                if USE_RESNET50_ACCURACY or USE_RESNET18_FAST or USE_RESNET34_FAST or USE_EFFICIENTNET:
+                if USE_RESNET101_ACCURACY or USE_RESNET18_FAST or USE_RESNET34_FAST or USE_EFFICIENTNET:
                     scheduler.step()
                 optimizer.zero_grad()
         train_loss = running_loss / len(train_loader)
@@ -467,7 +467,7 @@ else:
         history['val_loss'].append(val_loss)
         history['val_acc'].append(val_acc)
         did_validate = (epoch + 1) % VAL_EVERY_N == 0 or epoch == 0
-        if epoch >= WARMUP_EPOCHS and not (USE_RESNET50_ACCURACY or USE_RESNET18_FAST or USE_RESNET34_FAST or USE_EFFICIENTNET):
+        if epoch >= WARMUP_EPOCHS and not (USE_RESNET101_ACCURACY or USE_RESNET18_FAST or USE_RESNET34_FAST or USE_EFFICIENTNET):
             scheduler.step(val_acc)
         if did_validate and val_acc > best_val_acc:
             best_val_acc = val_acc
