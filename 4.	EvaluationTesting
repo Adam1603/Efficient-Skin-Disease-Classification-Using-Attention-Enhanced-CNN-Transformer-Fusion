@@ -217,10 +217,10 @@ def _mcnemar_collect_probs(mdl):
 def _train_baseline_resnet_mcnemar(n_epochs, save_path=None):
     if 'build_ablation_model' in globals() and callable(globals()['build_ablation_model']):
         baseline = build_ablation_model('baseline_cnn').to(device)
-    elif 'ResNet50Classifier' in globals():
-        baseline = ResNet50Classifier(num_classes=NUM_CLASSES, dropout=DROPOUT).to(device)
+    elif 'ResNet101Classifier' in globals():
+        baseline = ResNet101Classifier(num_classes=NUM_CLASSES, dropout=DROPOUT).to(device)
     else:
-        raise RuntimeError('Run the model cell (ResNet50Classifier) or ablation cell (build_ablation_model).')
+        raise RuntimeError('Run the model cell (ResNet101Classifier) or ablation cell (build_ablation_model).')
     crit = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=LABEL_SMOOTHING)
     opt = torch.optim.Adam(baseline.parameters(), lr=LEARNING_RATE, betas=(0.9, 0.999), weight_decay=WEIGHT_DECAY)
     sched = torch.optim.lr_scheduler.OneCycleLR(
@@ -295,13 +295,13 @@ else:
                 if 'build_ablation_model' in globals() and callable(globals()['build_ablation_model']):
                     baseline_m = build_ablation_model('baseline_cnn').to(device)
                 else:
-                    baseline_m = ResNet50Classifier(num_classes=NUM_CLASSES, dropout=DROPOUT).to(device)
+                    baseline_m = ResNet101Classifier(num_classes=NUM_CLASSES, dropout=DROPOUT).to(device)
                 baseline_m.load_state_dict(torch.load(ckpt, map_location=device))
                 baseline_m.eval()
                 print('Loaded McNemar baseline from', ckpt)
                 _mcnemar_status = 'loaded checkpoint; evaluating...'
             else:
-                print('Training ResNet50 baseline for McNemar (max %d epochs; set MCNEMAR_BASELINE_EPOCHS = EPOCHS_SINGLE for 80)...' % MCNEMAR_BASELINE_EPOCHS)
+                print('Training ResNet101 baseline for McNemar (max %d epochs; set MCNEMAR_BASELINE_EPOCHS = EPOCHS_SINGLE for 80)...' % MCNEMAR_BASELINE_EPOCHS)
                 baseline_m = _train_baseline_resnet_mcnemar(MCNEMAR_BASELINE_EPOCHS, save_path=ckpt)
                 _mcnemar_status = 'trained baseline; evaluating...'
             print('Collecting baseline predictions on test set (TTA may take several minutes)...')
