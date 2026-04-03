@@ -178,6 +178,9 @@ class ResNet50Classifier(nn.Module):
     def forward(self, x):
         return self.backbone(x)
 
+
+
+
 # ABLATION_REGISTRY: names -> constructor kwargs for HybridResNetTransformer (and special cases)
 ABLATION_REGISTRY = {
     'baseline_cnn': {'kind': 'resnet50'},
@@ -195,6 +198,7 @@ class TransformerOnlySkin(nn.Module):
     def __init__(self, num_classes=NUM_CLASSES, embed_dim=256, depth=4, heads=8, mlp_dim=1024, dropout=0.35,
                  patch_size=16, img_size=224):
         super().__init__()
+        H = W = img_size // patch_size
         self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
         nb = H * W + 1
         self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
@@ -302,7 +306,7 @@ def print_metrics_manuscript(m, title='Evaluation metrics'):
     for c, v in m['per_class'].items():
         print('  %s: P=%.4f R=%.4f F1=%.4f (n=%d)' % (c, v['precision'], v['recall'], v['f1'], v['support']))
 
-print('Ablation builders and metric helpers loaded (build_ablation_model, mcnemar_test, detailed_classification_metrics).')
+print('[OK] Ablation helpers ready: build_ablation_model, mcnemar_test, detailed_classification_metrics.')
 
 
 
