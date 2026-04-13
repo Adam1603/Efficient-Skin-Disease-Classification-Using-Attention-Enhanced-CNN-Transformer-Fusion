@@ -79,28 +79,44 @@ Link: https://www.kaggle.com/datasets/kmader/skin-cancer-mnist-ham10000
 
 o	**Clear explanation of folder structure and code organization**
 
+1. Clear Folder Structure of HAM10000
+The raw dataset is typically downloaded as several zip files, which, when extracted, result in a structure organized around images and metadata.
+
+HAM10000/
+├── HAM10000_images_part_1/     # Part 1: Contains 5,000 images (.jpg)
+│   ├── ISIC_0024306.jpg
+│   └── ...
+├── HAM10000_images_part_2/     # Part 2: Contains 5,015 images (.jpg)
+│   ├── ISIC_0029306.jpg
+│   └── ...
+├── HAM10000_metadata.csv       # Metadata, labels, and metadata info
+├── HAM10000_images_test/       # (Optional) Separate test images
+└── HAM10000_GroundTruth.csv    # (Optional) Ground truth for test set
+
+2. Code Organization and Data PipelineBecause the images are split into two folders (part_1 and part_2), the first step in code organization is to create a mapping that allows the code to locate any image regardless of its folder.
+
 Ablation taxonomy (expanded code / experimental design):
+Setting	Description:
+o baseline_cnn	-Strong CNN-only baseline (ResNet50 classifier head).
+o cnn_backbone_gap_only-	Same ResNet trunk as hybrid + GAP + head — no CBAM, no Transformer (ablation).
+o cnn_cbam_gap_only	-ResNet trunk + CBAM + GAP + head — no Transformer (attention on CNN features only).
+o transformer_only	-Pure Transformer on image patches (no ResNet trunk).
+o cnn_transformer_no_attention	-ResNet + Transformer without CBAM (no channel/spatial attention).
+o cnn_transformer_with_attention	-Proposed ResNet + CBAM + Transformer (use_cbam=True, default hybrid).
+o proposed_with_fusion_refine	-Proposed + feature fusion refinement MLP before the classifier head.
+o proposed_no_fusion_refine	-Proposed hybrid without the refinement MLP.
 
-Setting	Description
-baseline_cnn	-Strong CNN-only baseline (ResNet50 classifier head).
-cnn_backbone_gap_only-	Same ResNet trunk as hybrid + GAP + head — no CBAM, no Transformer (ablation).
-cnn_cbam_gap_only	-ResNet trunk + CBAM + GAP + head — no Transformer (attention on CNN features only).
-transformer_only	-Pure Transformer on image patches (no ResNet trunk).
-cnn_transformer_no_attention	-ResNet + Transformer without CBAM (no channel/spatial attention).
-cnn_transformer_with_attention	-Proposed ResNet + CBAM + Transformer (use_cbam=True, default hybrid).
-proposed_with_fusion_refine	-Proposed + feature fusion refinement MLP before the classifier head.
-proposed_no_fusion_refine	-Proposed hybrid without the refinement MLP.
-
+Comprehensive Code Repository:
 1. DataPreprocessing Pipeline-   detailed preprocessing scripts, including image resizing, normalization, augmentation techniques
 2. Training Pipeline- o	Model architecture definitions
-o	Hyperparameter settings (learning rate, batch size, optimizer, epochs, etc.)
-o	Training procedures for both individual models and the fusion framework
-o	Random seed initialization to ensure reproducibility
-3. 3.	Evaluation and Testing - o	Accuracy, precision, recall, and F1-score computation
-o	Confusion matrix and normalized heatmap generation
-o	Support for multi-dataset evaluation
-4. 4.	README- o	Step-by-step instructions to reproduce results
-o	Environment setup and dependency requirements
-o	Dataset access instructions
+                      o	Hyperparameter settings (learning rate, batch size, optimizer, epochs, etc.)
+                      o	Training procedures for both individual models and the fusion framework
+                      o	Random seed initialization to ensure reproducibility
+3. Evaluation and Testing - o	Accuracy, precision, recall, and F1-score computation
+                            o	Confusion matrix and normalized heatmap generation
+                            o	Support for multi-dataset evaluation
+4. README- o	Step-by-step instructions to reproduce results
+           o	Environment setup and dependency requirements
+           o	Dataset access instructions
 
 
